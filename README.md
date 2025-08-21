@@ -2,6 +2,8 @@
 
 A macOS background daemon that automatically switches OBS scenes based on the currently focused application.
 
+**Linux support next.**
+
 ## Features
 
 - 🎬 **Automatic Scene Switching** - Switches OBS scenes when you change applications
@@ -44,9 +46,19 @@ The daemon is built with a clean, modular architecture with separate Python modu
 
 ## Prerequisites
 
-- macOS (tested on macOS 12+)
+- **macOS** or **Linux** (Windows support planned)
 - Python 3.8 or higher
 - OBS Studio 28.0+ (includes WebSocket server by default)
+
+### Platform-Specific Requirements
+
+**macOS:**
+- PyObjC (automatically installed via requirements.txt)
+
+**Linux:**
+- psutil (automatically installed via requirements.txt)
+- Optional: xdotool, wmctrl, or xprop for better window detection
+- For Wayland: compositor-specific tools (swaymsg, hyprctl, etc.)
 
 ## Quick Start
 
@@ -57,19 +69,14 @@ git clone https://github.com/yourusername/vibeobs.git
 cd vibeobs
 ```
 
-### 2. Set up Python Environment (Optional but Recommended)
+### 2. Set up Python Environment
 
-Using uv (recommended):
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
-```
-
-Or using standard venv:
-```bash
+# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -81,18 +88,12 @@ pip install -r requirements.txt
 4. Note the port (default: 4455) and set a password
 5. Update `config.yaml` with your OBS connection details
 
-### 4. Install and Run
+### 4. Run the Daemon
 
 ```bash
-chmod +x install.sh uninstall.sh
-./install.sh
+source .venv/bin/activate
+python vibeobs_daemon.py
 ```
-
-The installer will:
-- Install Python dependencies (PyObjC, obs-websocket-py, PyYAML)
-- Set up configuration files
-- Install and start the launchd daemon
-- The daemon will start automatically on login
 
 ## Configuration
 
@@ -149,37 +150,22 @@ All changes take effect within 2 seconds!
 
 ### Managing the Daemon
 
-**Start/Install:**
+**Start:**
 ```bash
-./install.sh
+source .venv/bin/activate
+python vibeobs_daemon.py
 ```
 
-**Stop/Uninstall:**
+**Stop:**
 ```bash
-./uninstall.sh
-```
-
-**Check Status:**
-```bash
-launchctl list | grep vibeobs
+# Press Ctrl+C in the terminal running the daemon
 ```
 
 **View Logs:**
 ```bash
-# Main log
+# Logs are displayed in the terminal where daemon is running
+# Or check the log file (if configured)
 tail -f ~/.config/vibeobs/vibeobs.log
-
-# Error log
-tail -f ~/.config/vibeobs/stderr.log
-```
-
-**Manual Control:**
-```bash
-# Stop
-launchctl unload ~/Library/LaunchAgents/com.vibeobs.daemon.plist
-
-# Start
-launchctl load ~/Library/LaunchAgents/com.vibeobs.daemon.plist
 ```
 
 ## Creating OBS Scenes
@@ -204,10 +190,13 @@ Test the connection and scene switching:
 
 ```bash
 # Test OBS connection
-python test_obs_connection.py
+python tests/test_obs_connection.py
 
-# Test scene switching (requires daemon running)
-python test_scene_switch.py
+# Test individual components
+python tests/debug_components.py
+
+# Test daemon switching behavior
+python tests/test_daemon_switching.py
 ```
 
 ## Troubleshooting
@@ -245,17 +234,15 @@ vibeobs/
 ├── vibeobs_daemon.py        # Main daemon orchestrator
 ├── config_manager.py        # Configuration loading and hot-reload
 ├── obs_controller.py        # OBS WebSocket connection management
-├── window_monitor.py        # macOS window focus monitoring
+├── window_monitor.py        # Cross-platform window focus monitoring
 ├── __init__.py             # Package initialization
 ├── config.yaml             # Configuration file (YAML format)
-├── config.json             # Legacy JSON config (deprecated)
 ├── requirements.txt        # Python dependencies
-├── install.sh             # Installation script
-├── uninstall.sh          # Uninstallation script
-├── com.vibeobs.daemon.plist # launchd configuration
-├── test_obs_connection.py  # OBS connection tester
-├── test_scene_switch.py   # Scene switching demo
-└── README.md             # This file
+├── tests/                  # Test scripts and utilities
+│   ├── test_obs_connection.py    # OBS connection tester
+│   ├── debug_components.py       # Component debugging tool
+│   └── test_daemon_switching.py  # Daemon switching test
+└── README.md               # This file
 ```
 
 ## Privacy & Security
@@ -273,7 +260,7 @@ vibeobs/
   - PyYAML >= 6.0 (configuration)
 
 - **System Requirements:**
-  - macOS 12.0 or higher
+  - macOS 12.0+ or Linux (Ubuntu 20.04+, Fedora 35+, etc.)
   - Python 3.8 or higher
   - OBS Studio 28.0 or higher
 
@@ -358,6 +345,9 @@ python -c "from window_monitor import WindowMonitor; import logging; wm = Window
 
 # Run with custom config
 python vibeobs_daemon.py /path/to/custom/config.yaml
+
+# Run comprehensive component tests
+python tests/debug_components.py
 ```
 
 ## License
