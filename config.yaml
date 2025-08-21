@@ -1,0 +1,23 @@
+obs:
+  host: 192.168.8.187
+  port: 4455
+  password: YAzsQeJ1OPMkABG6
+
+app_scene_mappings:
+  Emacs: editor-focused
+  Alacritty: terminal-f
+  Google Chrome: browser-focused
+  Terminal: terminal-f
+  iTerm: terminal-f
+  Safari: browser-focused
+  Firefox: browser-focused
+  Code: editor-focused
+  Visual Studio Code: editor-focused
+  Slack: entire-screen
+  Discord: entire-screen
+  Zoom: entire-screen
+  Finder: entire-screen
+
+polling_interval: 0.5
+log_level: INFO
+log_file: ~/.config/vibeobs/vibeobs.log
