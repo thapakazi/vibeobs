@@ -1,310 +1,263 @@
 #!/usr/bin/env python3
+"""
+VibeOBS Daemon - Automatic OBS Scene Switcher for macOS
+Main daemon that orchestrates window monitoring and OBS scene switching.
+"""
 
-import yaml
 import logging
-import os
 import signal
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
-try:
-    from AppKit import NSWorkspace
-except ImportError:
-    print("Can't import AppKit -- Install with: pip install PyObjC")
-    sys.exit(1)
-
-try:
-    from obswebsocket import obsws, requests
-except ImportError:
-    print("Can't import obswebsocket -- Install with: pip install obs-websocket-py")
-    sys.exit(1)
+# Import modular components
+from config_manager import ConfigManager
+from obs_controller import OBSController
+from window_monitor import WindowMonitor
 
 
 class VibeOBSDaemon:
-    def __init__(self, config_path=None):
+    """Main daemon orchestrator for VibeOBS"""
+    
+    def __init__(self, config_path: Optional[Path] = None):
+        """
+        Initialize VibeOBS Daemon
+        
+        Args:
+            config_path: Optional path to configuration file
+        """
         self.running = True
-        self.config_path = config_path or Path.home() / ".config" / "vibeobs" / "config.yaml"
-        self.config = {}
-        self.actual_config_path = None
-        self.config_mtime = None
-        self.load_and_apply_config()
-        self.obs_client = None
-        self.last_active_app = None
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10
         
-        signal.signal(signal.SIGTERM, self.handle_signal)
-        signal.signal(signal.SIGINT, self.handle_signal)
-
-    def load_and_apply_config(self):
-        """Load configuration and apply settings"""
-        new_config = self.load_config()
-        if new_config:
-            old_config = self.config
-            self.config = new_config
-            
-            # Update config modification time
-            if self.actual_config_path and self.actual_config_path.exists():
-                self.config_mtime = self.actual_config_path.stat().st_mtime
-            
-            # Setup or reconfigure logging if needed
-            if not hasattr(self, 'logger') or old_config.get('log_level') != new_config.get('log_level'):
-                self.setup_logging()
-                if hasattr(self, 'logger'):
-                    self.logger.info("Configuration reloaded successfully")
-            
-            # Disconnect OBS client if connection settings changed
-            if old_config and self.obs_client:
-                old_obs = old_config.get('obs', {})
-                new_obs = new_config.get('obs', {})
-                if (old_obs.get('host') != new_obs.get('host') or 
-                    old_obs.get('port') != new_obs.get('port') or
-                    old_obs.get('password') != new_obs.get('password')):
-                    try:
-                        self.obs_client.disconnect()
-                        self.obs_client = None
-                        if hasattr(self, 'logger'):
-                            self.logger.info("OBS connection settings changed, disconnected from OBS")
-                    except:
-                        pass
-            
-            return True
-        return False
-
-    def load_config(self):
-        """Load configuration from YAML file or use defaults"""
-        default_config = {
-            "obs": {
-                "host": "localhost",
-                "port": 4455,
-                "password": ""
-            },
-            "app_scene_mappings": {
-                "Emacs": "editor",
-                "Alacritty": "terminal",
-                "Chrome": "browser"
-            },
-            "polling_interval": 0.5,
-            "log_level": "INFO",
-            "log_file": str(Path.home() / ".config" / "vibeobs" / "vibeobs.log")
+        # Initialize configuration manager
+        self.config_manager = ConfigManager(config_path)
+        self.config = self.config_manager.load()
+        
+        if not self.config:
+            print("Failed to load configuration. Exiting.")
+            sys.exit(1)
+        
+        # Setup logging
+        self.logger = self._setup_logging()
+        
+        # Initialize controllers
+        self.obs_controller = OBSController(self.config, self.logger)
+        self.window_monitor = WindowMonitor(self.logger)
+        
+        # Register window change callback
+        self.window_monitor.register_callback(self._on_app_change)
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        
+        # Statistics
+        self.stats = {
+            "scenes_switched": 0,
+            "failed_switches": 0,
+            "config_reloads": 0,
+            "start_time": time.time()
         }
+    
+    def _setup_logging(self) -> logging.Logger:
+        """
+        Configure logging based on config
         
-        # First try local config.yaml in the same directory
-        local_config_path = Path(__file__).parent / "config.yaml"
-        config_to_use = None
-        
-        if local_config_path.exists():
-            try:
-                with open(local_config_path, 'r') as f:
-                    user_config = yaml.safe_load(f)
-                    if user_config:  # Check if YAML is valid and not empty
-                        # Merge user config with defaults
-                        for key, value in user_config.items():
-                            if isinstance(value, dict) and key in default_config:
-                                default_config[key].update(value)
-                            else:
-                                default_config[key] = value
-                        self.actual_config_path = local_config_path
-                        print(f"Loaded config from: {local_config_path}")
-                        config_to_use = default_config
-            except yaml.YAMLError as e:
-                print(f"Error parsing YAML from {local_config_path}: {e}")
-                return None
-            except Exception as e:
-                print(f"Error loading local config: {e}")
-                return None
-        
-        # Then check the user config path
-        elif self.config_path.exists():
-            try:
-                with open(self.config_path, 'r') as f:
-                    user_config = yaml.safe_load(f)
-                    if user_config:  # Check if YAML is valid and not empty
-                        # Merge user config with defaults
-                        for key, value in user_config.items():
-                            if isinstance(value, dict) and key in default_config:
-                                default_config[key].update(value)
-                            else:
-                                default_config[key] = value
-                        self.actual_config_path = self.config_path
-                        print(f"Loaded config from: {self.config_path}")
-                        config_to_use = default_config
-            except yaml.YAMLError as e:
-                print(f"Error parsing YAML from {self.config_path}: {e}")
-                return None
-            except Exception as e:
-                print(f"Error loading config: {e}")
-                return None
-        
-        # If no config file found, use defaults
-        if config_to_use is None:
-            print("No config file found, using defaults")
-            config_to_use = default_config
-        
-        return config_to_use
-
-    def check_config_changes(self):
-        """Check if config file has been modified and reload if valid"""
-        if self.actual_config_path and self.actual_config_path.exists():
-            current_mtime = self.actual_config_path.stat().st_mtime
-            if current_mtime != self.config_mtime:
-                self.logger.info(f"Config file changed, attempting to reload...")
-                
-                # Try to load the new config
-                if self.load_and_apply_config():
-                    self.logger.info(f"Config reloaded successfully from {self.actual_config_path}")
-                    self.logger.info(f"Monitoring applications: {list(self.config['app_scene_mappings'].keys())}")
-                else:
-                    self.logger.error("Failed to reload config - keeping previous configuration")
-
-    def setup_logging(self):
-        """Configure logging based on config settings"""
+        Returns:
+            Configured logger instance
+        """
         log_level = getattr(logging, self.config.get("log_level", "INFO"))
         log_file = self.config.get("log_file")
         
-        # Expand ~ in path
-        if log_file and "~" in log_file:
-            log_file = os.path.expanduser(log_file)
-        
-        # Create log directory if it doesn't exist
+        # Create log directory if needed
         if log_file:
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         
         # Clear existing handlers
         logger = logging.getLogger("VibeOBS")
         logger.handlers.clear()
+        logger.setLevel(log_level)
         
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file) if log_file else logging.StreamHandler(),
-                logging.StreamHandler()  # Also log to console
-            ]
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-        self.logger = logging.getLogger("VibeOBS")
-
-    def handle_signal(self, signum, frame):
-        """Handle shutdown signals gracefully"""
+        
+        # Add handlers
+        if log_file:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        
+        # Always add console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        return logger
+    
+    def _handle_signal(self, signum, frame):
+        """
+        Handle shutdown signals gracefully
+        
+        Args:
+            signum: Signal number
+            frame: Current stack frame
+        """
         self.logger.info(f"Received signal {signum}. Shutting down...")
         self.running = False
-
-    def connect_to_obs(self):
-        """Connect to OBS WebSocket server"""
-        try:
-            obs_config = self.config["obs"]
-            self.obs_client = obsws(
-                obs_config["host"],
-                obs_config["port"],
-                obs_config.get("password", "")
-            )
-            self.obs_client.connect()
-            self.logger.info(f"Connected to OBS at {obs_config['host']}:{obs_config['port']}")
-            self.reconnect_attempts = 0
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to connect to OBS: {e}")
-            self.obs_client = None
-            return False
-
-    def switch_scene(self, scene_name):
-        """Switch to the specified OBS scene"""
-        if not self.obs_client:
-            if not self.connect_to_obs():
-                return False
+    
+    def _reload_config(self) -> bool:
+        """
+        Reload configuration and update components
         
-        try:
-            # First get the list of available scenes to validate
-            scenes = self.obs_client.call(requests.GetSceneList())
-            available_scenes = [s['sceneName'] for s in scenes.getScenes()]
-            
-            if scene_name not in available_scenes:
-                self.logger.warning(f"Scene '{scene_name}' not found. Available scenes: {available_scenes}")
-                return False
-            
-            # Switch to the scene
-            self.obs_client.call(requests.SetCurrentProgramScene(sceneName=scene_name))
-            self.logger.info(f"Switched to scene: {scene_name}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error switching scene: {e}")
-            # Try to reconnect on next attempt
-            self.obs_client = None
+        Returns:
+            True if reload successful, False otherwise
+        """
+        if not self.config_manager.reload():
             return False
-
-    def get_active_app_name(self):
-        """Get the name of the currently active application"""
-        try:
-            active_app = NSWorkspace.sharedWorkspace().activeApplication()
-            return active_app['NSApplicationName']
-        except Exception as e:
-            self.logger.error(f"Error getting active application: {e}")
-            return None
-
+        
+        new_config = self.config_manager.config
+        old_log_level = self.config.get("log_level")
+        
+        # Update OBS controller
+        self.obs_controller.update_config(new_config)
+        
+        # Update logging if needed
+        if old_log_level != new_config.get("log_level"):
+            self.config = new_config
+            self.logger = self._setup_logging()
+            self.obs_controller.logger = self.logger
+            self.window_monitor.logger = self.logger
+        
+        self.config = new_config
+        self.stats["config_reloads"] += 1
+        
+        self.logger.info("Configuration reloaded successfully")
+        self.logger.info(f"Monitoring apps: {list(self.config['app_scene_mappings'].keys())}")
+        
+        return True
+    
+    def _on_app_change(self, old_app: str, new_app: str):
+        """
+        Callback for application changes
+        
+        Args:
+            old_app: Previous application name
+            new_app: New application name
+        """
+        self.logger.debug(f"App changed: {old_app} → {new_app}")
+        
+        # Check if new app has a scene mapping
+        if new_app not in self.config["app_scene_mappings"]:
+            self.logger.debug(f"No scene mapping for: {new_app}")
+            return
+        
+        scene_name = self.config["app_scene_mappings"][new_app]
+        self.logger.info(f"App '{new_app}' activated, switching to scene '{scene_name}'")
+        
+        if self.obs_controller.switch_scene(scene_name):
+            self.stats["scenes_switched"] += 1
+        else:
+            self.stats["failed_switches"] += 1
+            self.logger.warning(f"Failed to switch to scene '{scene_name}'")
+    
+    def _print_startup_info(self):
+        """Print startup information"""
+        self.logger.info("=" * 60)
+        self.logger.info("VibeOBS Daemon Started")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Config: {self.config_manager.actual_config_path}")
+        self.logger.info(f"Log Level: {self.config.get('log_level', 'INFO')}")
+        self.logger.info(f"Polling Interval: {self.config.get('polling_interval', 0.5)}s")
+        self.logger.info(f"OBS Host: {self.config.get('obs', {}).get('host', 'localhost')}")
+        self.logger.info(f"OBS Port: {self.config.get('obs', {}).get('port', 4455)}")
+        
+        mappings = self.config.get('app_scene_mappings', {})
+        self.logger.info(f"Monitoring {len(mappings)} applications:")
+        for app, scene in mappings.items():
+            self.logger.info(f"  {app} → {scene}")
+        self.logger.info("=" * 60)
+    
+    def _print_shutdown_stats(self):
+        """Print statistics on shutdown"""
+        uptime = time.time() - self.stats["start_time"]
+        hours = int(uptime // 3600)
+        minutes = int((uptime % 3600) // 60)
+        seconds = int(uptime % 60)
+        
+        self.logger.info("=" * 60)
+        self.logger.info("VibeOBS Daemon Statistics")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Uptime: {hours}h {minutes}m {seconds}s")
+        self.logger.info(f"Scenes Switched: {self.stats['scenes_switched']}")
+        self.logger.info(f"Failed Switches: {self.stats['failed_switches']}")
+        self.logger.info(f"Config Reloads: {self.stats['config_reloads']}")
+        
+        # Get additional stats from components
+        obs_stats = self.obs_controller.get_stats()
+        window_stats = self.window_monitor.get_stats()
+        
+        self.logger.info(f"OBS Connected: {obs_stats.get('connected', False)}")
+        self.logger.info(f"Current Scene: {obs_stats.get('current_scene', 'Unknown')}")
+        self.logger.info(f"Current App: {window_stats.get('current_app', 'Unknown')}")
+        self.logger.info("=" * 60)
+    
     def run(self):
         """Main daemon loop"""
-        self.logger.info("VibeOBS Daemon started")
-        self.logger.info(f"Config file: {self.actual_config_path}")
-        self.logger.info(f"Monitoring applications: {list(self.config['app_scene_mappings'].keys())}")
+        self._print_startup_info()
         
         # Initial OBS connection
-        if not self.connect_to_obs():
+        if not self.obs_controller.connect():
             self.logger.warning("Initial OBS connection failed. Will retry during operation.")
         
+        # Timing variables
         last_config_check = time.time()
-        config_check_interval = 2  # Check config every 2 seconds
+        config_check_interval = 2  # seconds
         
-        while self.running:
-            try:
-                # Check for config file changes periodically
-                if time.time() - last_config_check > config_check_interval:
-                    self.check_config_changes()
-                    last_config_check = time.time()
-                
-                current_app = self.get_active_app_name()
-                
-                if current_app and current_app != self.last_active_app:
-                    self.logger.debug(f"Active app changed: {self.last_active_app} -> {current_app}")
-                    self.last_active_app = current_app
+        try:
+            while self.running:
+                try:
+                    # Check for config changes
+                    if time.time() - last_config_check > config_check_interval:
+                        if self.config_manager.has_changed():
+                            self.logger.info("Config file changed, reloading...")
+                            if not self._reload_config():
+                                self.logger.error("Failed to reload config")
+                        last_config_check = time.time()
                     
-                    # Check if this app has a scene mapping
-                    if current_app in self.config["app_scene_mappings"]:
-                        scene_name = self.config["app_scene_mappings"][current_app]
-                        self.logger.info(f"App '{current_app}' activated, switching to scene '{scene_name}'")
-                        
-                        if not self.switch_scene(scene_name):
-                            self.reconnect_attempts += 1
-                            if self.reconnect_attempts >= self.max_reconnect_attempts:
-                                self.logger.error(f"Max reconnection attempts ({self.max_reconnect_attempts}) reached. Continuing without OBS.")
-                    else:
-                        self.logger.debug(f"No scene mapping for app: {current_app}")
-                
-                time.sleep(self.config["polling_interval"])
-                
-            except KeyboardInterrupt:
-                self.logger.info("Keyboard interrupt received")
-                break
-            except Exception as e:
-                self.logger.error(f"Unexpected error in main loop: {e}")
-                time.sleep(1)  # Prevent rapid error loops
+                    # Check for window changes
+                    self.window_monitor.check_and_notify()
+                    
+                    # Sleep before next check
+                    time.sleep(self.config.get("polling_interval", 0.5))
+                    
+                except KeyboardInterrupt:
+                    self.logger.info("Keyboard interrupt received")
+                    break
+                except Exception as e:
+                    self.logger.error(f"Unexpected error: {e}", exc_info=True)
+                    time.sleep(1)  # Prevent rapid error loops
         
-        # Cleanup
-        if self.obs_client:
-            try:
-                self.obs_client.disconnect()
-                self.logger.info("Disconnected from OBS")
-            except:
-                pass
-        
-        self.logger.info("VibeOBS Daemon stopped")
+        finally:
+            # Cleanup
+            self.obs_controller.disconnect()
+            self._print_shutdown_stats()
+            self.logger.info("VibeOBS Daemon stopped")
 
 
 def main():
     """Entry point for the daemon"""
-    daemon = VibeOBSDaemon()
+    # Check for command line arguments
+    config_path = None
+    if len(sys.argv) > 1:
+        config_path = Path(sys.argv[1])
+        if not config_path.exists():
+            print(f"Error: Config file not found: {config_path}")
+            sys.exit(1)
+    
+    # Create and run daemon
+    daemon = VibeOBSDaemon(config_path)
     daemon.run()
 
 

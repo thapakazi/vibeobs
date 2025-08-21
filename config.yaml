@@ -7,16 +7,6 @@ app_scene_mappings:
   Emacs: editor-focused
   Alacritty: terminal-f
   Google Chrome: browser-focused
-  Terminal: terminal-f
-  iTerm: terminal-f
-  Safari: browser-focused
-  Firefox: browser-focused
-  Code: editor-focused
-  Visual Studio Code: editor-focused
-  Slack: entire-screen
-  Discord: entire-screen
-  Zoom: entire-screen
-  Finder: entire-screen
 
 polling_interval: 0.5
 log_level: INFO
